@@ -25,19 +25,31 @@ type httpResponseOutput struct {
 }
 
 type httpRequestInput struct {
-	HTTPMethod      string              `json:"httpMethod"`
-	Path            string              `json:"path"`
+	// common to both formats
+	Version         string              `json:"version"`
 	Headers         map[string]string   `json:"headers,omitempty"`
-	HeadersMV       map[string][]string `json:"multiValueHeaders,omitempty"`
-	Query           map[string]string   `json:"queryStringParameters"`
-	QueryMV         map[string][]string `json:"multiValueQueryStringParameters"`
 	Body            string              `json:"body"`
 	IsBase64Encoded *bool               `json:"isBase64Encoded,omitempty"`
 	RequestContext  struct {
 		Elb struct {
 			TargetGroupArn string `json:"targetGroupArn"`
 		} `json:"elb"`
+		Http struct {
+			Method string `json:"method"`
+		} `json:"http"`
 	} `json:"requestContext"`
+
+	// v1
+	HTTPMethod      string              `json:"httpMethod"`
+	Path            string              `json:"path"`
+	HeadersMV       map[string][]string `json:"multiValueHeaders,omitempty"`
+	Query           map[string]string   `json:"queryStringParameters"`
+	QueryMV         map[string][]string `json:"multiValueQueryStringParameters"`
+
+	// v2
+	RawPath         string              `json:"rawPath"`
+	RawQueryString  string              `json:"rawQueryString"`
+	Cookies         []string            `json:"cookies"`
 }
 
 func lambdaResponseForHttpResponse(input *lambdaruntime.FunctionNextOutput, resp *http.Response) (*httpResponseOutput, error) {
@@ -63,7 +75,7 @@ func lambdaResponseForHttpResponse(input *lambdaruntime.FunctionNextOutput, resp
 
 	isSingleValuedHeadersALB := len(hrInput.RequestContext.Elb.TargetGroupArn) > 0 && hrInput.HeadersMV == nil
 
-	if isSingleValuedHeadersALB {
+	if isSingleValuedHeadersALB || hrInput.Version == "2.0" {
 		output.Headers = map[string]string{}
 		for name, values := range resp.Header {
 			output.Headers[name] = values[0]
@@ -94,7 +106,7 @@ func httpRequestForLambdaInvocation(input *lambdaruntime.FunctionNextOutput, por
 		}
 
   		req, _ = http.NewRequest("POST", fmt.Sprintf("%s/%s", base, path), bytes.NewReader(input.Body))
-	} else {
+	} else if hrInput.Version == "1.0" {
 		isHttpRequest = true
 		var body io.Reader = strings.NewReader(hrInput.Body)
 		if *hrInput.IsBase64Encoded {
@@ -131,6 +143,28 @@ func httpRequestForLambdaInvocation(input *lambdaruntime.FunctionNextOutput, por
 		}
 
 		req.Host = req.Header.Get("Host")
+	} else if hrInput.Version == "2.0" {
+		isHttpRequest = true
+		var body io.Reader = strings.NewReader(hrInput.Body)
+		if *hrInput.IsBase64Encoded {
+			body = base64.NewDecoder(base64.StdEncoding, body)
+		}
+
+		u, _ := url.Parse(base + hrInput.RawPath)
+		u.RawQuery = hrInput.RawQueryString
+		req, _ = http.NewRequest(hrInput.RequestContext.Http.Method, u.String(), body)
+
+		for name, value := range hrInput.Headers {
+			req.Header.Add(name, value)
+		}
+
+		if len(hrInput.Cookies) > 0 {
+			req.Header.Add("Cookie", strings.Join(hrInput.Cookies, "; "))
+		}
+
+		req.Host = req.Header.Get("Host")
+	} else {
+		return nil, false, errors.New(fmt.Sprintf("Unsupported request version: %v", hrInput.Version))
 	}
 
 	req.Header.Set("Lambda-Runtime-Aws-Request-Id", input.RequestId)
